@@ -361,56 +361,54 @@ class DialogueSystem:
             )
             self.voice_chat.start_session()
 
-        
+        # Send initial message to API to generate audio
+        if self.voice_chat and self.voice_chat.connected:
+            # Create an assistant message event
+            assistant_event = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",  # Mark as assistant (NPC) message
+                    "content": [{"type": "input_text", "text": self.npc_message}]
+                }
+            }
+            self.voice_chat.send_event(assistant_event)
+            print(f"[DialogueSystem] Sent initial NPC message to API: {self.npc_message}")
+
+            # Trigger audio response (optional, depending on API behavior)
+            response_event = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text", "audio"],
+                    "instructions": system_prompt
+                }
+            }
+            self.voice_chat.send_event(response_event)
+            print("[DialogueSystem] Requested audio for initial message")
+        else:
+            print("[DialogueSystem] Warning: Voice chat not connected, initial message will not be spoken")
         # Disable text input
         self.input_active = True # Changed from True
-                
-        # Set initial NPC message
-        self.npc_message = initial_message[npc_role]
+
         print(f"[DialogueSystem] Initial message: {self.npc_message}")
 
+
     def handle_interruption(self):
-        self.interrupt_flag = True
         if self.voice_chat:
             self.voice_chat.stop_playback()
-            self.voice_chat.send_event({
-                "type": "interruption",
-                "timestamp": time.time()
-            })
-        self.response_buffer = ""
+            self.npc_message = ""  # Clear current message
+            self.voice_chat.send_event({"type": "interruption"})
+            print("[DialogueSystem] Interrupted NPC")
 
 
     def send_message(self):
-        if not self.conversation_history:
-            print("[DialogueSystem] No conversation history to send.")
-            return
+        if self.user_input.strip():  # Check if input is not empty
+            print(f"[DialogueSystem] User said: {self.user_input}")
+            self.voice_chat.send_text_input(self.user_input.strip())
+            self.user_input = ""  # Clear the input after sending
+        else:
+            print("[DialogueSystem] No input to send.")
 
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4-0125-preview", 
-                messages=self.conversation_history,
-                temperature=0.85,
-                max_tokens=150,
-                response_format={ "type": "text" },
-                top_p=0.95,
-                frequency_penalty=0.2,
-                presence_penalty=0.1
-            )
-            ai_message = response.choices[0].message.content
-            
-            # Store the message in conversation history
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": ai_message
-            })
-            
-            # Set the NPC message with white text color
-            self.npc_message = ai_message
-            
-            print(f"[DialogueSystem] NPC says: {self.npc_message}")
-        except Exception as e:
-            self.npc_message = "I apologize, but I'm having trouble connecting to our systems right now."
-            print(f"[DialogueSystem] Error: {e}")
 
     def render(self):
         if not self.active:
@@ -434,6 +432,7 @@ class DialogueSystem:
             quit_text_surface = self.font.render("Press Shift+Q to exit", True, (255, 255, 255))
             self.ui_surface.blit(quit_text_surface, (40, box_y + 10))
 
+            print(f"[DialogueSystem] Rendering npc_message: '{self.npc_message}'")
             # NPC message in white
             if self.npc_message:
                 self.render_text(self.ui_surface, self.npc_message, 40, box_y + 40)
@@ -506,11 +505,13 @@ class DialogueSystem:
                 # Add user message to conversation history
                 self.conversation_history.append({"role": "user", "content": self.user_input.strip()})
                 
+                # Send message to AI
+                self.send_message()
+                
                 # Clear user input
                 self.user_input = ""
 
-                # Send message to AI
-                self.send_message()
+                
             elif event.key == pygame.K_BACKSPACE:
                 self.user_input = self.user_input[:-1]
             elif event.unicode.isprintable():
@@ -826,24 +827,38 @@ class RealtimeVoiceChat:
         })
 
     def on_message(self, ws, message):
-        """Handle incoming WebSocket messages."""
         try:
             event = json.loads(message)
-            print(f"[RealtimeVoiceChat] Received event: {event['type']}")
+            print(f"[RealtimeVoiceChat] Received event: {event['type']} - Full payload: {json.dumps(event, indent=2)}")
             
             if event['type'] == 'session.created':
                 self.session_id = event['session']['id']
                 print(f"[RealtimeVoiceChat] Session ID: {self.session_id}")
+                
+            elif event['type'] == 'response.created':
+                print("[RealtimeVoiceChat] Response generation started")
                 
             elif event['type'] == 'response.audio.delta':
                 audio_data = event.get('delta', '')
                 if audio_data:
                     pcm_data = base64.b64decode(audio_data)
                     audio_array = np.frombuffer(pcm_data, dtype=self.DTYPE)
-                    self.audio_buffer.extend(audio_array)  # Add to playback buffer
+                    self.audio_buffer.extend(audio_array)
+                    print(f"[RealtimeVoiceChat] Queued {len(audio_array)} audio samples")
                     
             elif event['type'] == 'response.text.delta':
-                self.dialogue_system.npc_message += event['delta']
+                delta_text = event.get('delta', '')
+                self.dialogue_system.npc_message += delta_text  # Always append
+                print(f"[RealtimeVoiceChat] Appended text delta to npc_message: {delta_text}")
+
+                
+            elif event['type'] == 'response.done':
+                print("[RealtimeVoiceChat] Response completed")
+                
+            elif event['type'] == 'response.canceled':
+                self.dialogue_system.npc_message = ""
+                self.audio_buffer.clear()
+                print("[RealtimeVoiceChat] Response canceled, ready for new input")
                 
             elif event['type'] == 'error':
                 print(f"[RealtimeVoiceChat] API Error: {event.get('error', 'Unknown error')}")
@@ -902,6 +917,35 @@ class RealtimeVoiceChat:
         except Exception as e:
             print(f"Audio send error: {str(e)}")
 
+
+    def send_text_input(self, text):
+        if not self.connected:
+            print("[RealtimeVoiceChat] Cannot send text - WebSocket not connected")
+            return
+        # Create conversation item
+        item_event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            }
+        }
+        self.send_event(item_event)
+        print(f"[RealtimeVoiceChat] Sent text input: {text}")
+
+        # Trigger response
+        response_event = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "instructions": self.system_prompt  # Optional: reinforce context
+            }
+        }
+        self.send_event(response_event)
+        print("[RealtimeVoiceChat] Requested response generation")
+
+        
     def send_event(self, event):
         """Send an event to the WebSocket."""
         if not self.connected:
@@ -913,19 +957,7 @@ class RealtimeVoiceChat:
             print(f"Event send error: {str(e)}")
             self.stop()
 
-    def send_text_input(self, text):
-        """Send user text input as a conversation item via WebSocket."""
-        event = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text}
-                ]
-            }
-        }
-        self.send_event(event)
+
 
     def on_error(self, ws, error):
         print(f"WebSocket error: {str(error)}")
