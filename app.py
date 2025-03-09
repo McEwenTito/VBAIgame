@@ -25,8 +25,6 @@ from queue import Empty
 from collections import deque
 
 
-print(sd.query_devices())
-
 # Load environment variables
 load_dotenv()
 # Ensure OpenAI API Key is loaded
@@ -362,24 +360,11 @@ class DialogueSystem:
                 voice_config=self.current_voice_config
             )
             self.voice_chat.start_session()
-        
-        else:
-            # Reset existing session for new NPC
-            self.voice_chat.audio_buffer.clear()  # Clear old audio data
-            self.voice_chat.system_prompt = system_prompt
-            self.voice_chat.voice_config = self.current_voice_config
-            self.voice_chat.send_event({
-                "type": "session.update",
-                "session": {
-                    "instructions": system_prompt,
-                    "voice": self.current_voice_config.get('voice', 'nova')
-                }
-            })
 
         
         # Disable text input
-        self.input_active = False  # Changed from True
-        
+        self.input_active = True # Changed from True
+                
         # Set initial NPC message
         self.npc_message = initial_message[npc_role]
         print(f"[DialogueSystem] Initial message: {self.npc_message}")
@@ -735,14 +720,13 @@ class World:
         draw_cube()  # Replace glutSolidCube with draw_cube
         glPopMatrix()
 
-
 class RealtimeVoiceChat:
     def __init__(self, system_prompt, dialogue_system, voice_config):
         self.system_prompt = system_prompt
         self.dialogue_system = dialogue_system
         self.voice_config = voice_config
-        self.audio_queue = Queue()
-        self.audio_buffer = deque(maxlen=16000)  # 1 second of audio
+        self.audio_queue = Queue()  # For captured audio
+        self.audio_buffer = deque()  # For playback audio samples
         self.running = True
         self.session_id = None
         self.connected = False
@@ -759,63 +743,26 @@ class RealtimeVoiceChat:
         self.CHANNELS = 1
         self.DTYPE = np.int16
         
-        # Set default device and sample rate
-        device_index = 12  # HDA Intel PCH: ALC295 Analog
-        sd.default.device = device_index
-        sd.default.samplerate = self.SAMPLE_RATE
-        
-        # Debug: List available devices
-        print("[RealtimeVoiceChat] Available devices:")
-        print(sd.query_devices())
-        
-        # Initialize output stream
-        try:
-            self.output_stream = sd.OutputStream(
-                samplerate=self.SAMPLE_RATE,
-                channels=self.CHANNELS,
-                dtype=self.DTYPE,
-                callback=self.audio_callback,
-                blocksize=1024,
-                latency='low',
-                device=device_index
-            )
-            self.output_stream.start()
-            print(f"[RealtimeVoiceChat] Output stream started with device index: {device_index}, sample rate: {self.SAMPLE_RATE} Hz")
-        except Exception as e:
-            print(f"[RealtimeVoiceChat] Failed to start output stream: {e}")
-            raise
-        
-        # Timing debug
-        self.last_time = None
-        self.callback_count = 0
+        # Initialize continuous output stream
+        self.output_stream = sd.OutputStream(
+            samplerate=self.SAMPLE_RATE,
+            channels=self.CHANNELS,
+            dtype=self.DTYPE,
+            callback=self.audio_callback,
+            blocksize=512  # Smaller blocksize for lower latency
+        )
+        self.output_stream.start()
 
     def audio_callback(self, outdata, frames, time_info, status):
-        current_time = time.time()
-        if self.last_time is None:
-            self.last_time = current_time
-        
-        elapsed = current_time - self.last_time
-        expected = frames / self.SAMPLE_RATE
-        self.callback_count += 1
-        
-        if self.callback_count % 10 == 0:  # Log every ~0.64s
-            print(f"Callback #{self.callback_count}: Elapsed: {elapsed:.3f}s, Expected: {expected:.3f}s, Buffer size: {len(self.audio_buffer)}")
-        
-        self.last_time = current_time
-        
+        """Callback to continuously play audio from the buffer."""
         if status:
             print(f"Playback status: {status}")
         try:
-            if len(self.audio_buffer) >= frames:
-                for i in range(frames):
+            for i in range(frames):
+                if self.audio_buffer:
                     outdata[i, 0] = self.audio_buffer.popleft()
-            else:
-                available_samples = min(len(self.audio_buffer), frames)
-                for i in range(available_samples):
-                    outdata[i, 0] = self.audio_buffer.popleft()
-                for i in range(available_samples, frames):
-                    outdata[i, 0] = 0
-                print(f"[RealtimeVoiceChat] Buffer underflow: {len(self.audio_buffer)} samples remaining")
+                else:
+                    outdata[i, 0] = 0  # Fill with silence if buffer is empty
         except Exception as e:
             print(f"Callback error: {e}")
             outdata.fill(0)
@@ -892,7 +839,7 @@ class RealtimeVoiceChat:
                 if audio_data:
                     pcm_data = base64.b64decode(audio_data)
                     audio_array = np.frombuffer(pcm_data, dtype=self.DTYPE)
-                    self.audio_buffer.extend(audio_array)
+                    self.audio_buffer.extend(audio_array)  # Add to playback buffer
                     
             elif event['type'] == 'response.text.delta':
                 self.dialogue_system.npc_message += event['delta']
@@ -914,10 +861,8 @@ class RealtimeVoiceChat:
             samplerate=self.SAMPLE_RATE,
             channels=self.CHANNELS,
             dtype=self.DTYPE,
-            blocksize=1024,
-            callback=callback,
-            latency='low',
-            device=0  # Same device as output
+            blocksize=512,  # Reduced for lower latency
+            callback=callback
         ):
             print("Audio capture started")
             while self.running:
@@ -987,7 +932,7 @@ class RealtimeVoiceChat:
             if self.capture_thread.is_alive():
                 self.capture_thread.join(timeout=1)
         except Exception as e:
-            print(f"Error while stopping: {str(e)}")
+            print(f"Error while stopping: {str(e)}")        
 
 
 class Player:
