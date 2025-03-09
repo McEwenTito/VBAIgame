@@ -69,7 +69,7 @@ glTranslatef(0.0, 0.0, -5)
 # Voice Chat Configuration
 API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = "gpt-4o-realtime-preview-2024-12-17"
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 24000
 CHANNELS = 1
 DTYPE = np.int16
 
@@ -387,7 +387,7 @@ class DialogueSystem:
 
         try:
             response = client.chat.completions.create(
-                model=MODEL, 
+                model="gpt-4-0125-preview", 
                 messages=self.conversation_history,
                 temperature=0.85,
                 max_tokens=150,
@@ -739,7 +739,7 @@ class RealtimeVoiceChat:
         ]
         
         # Audio settings
-        self.SAMPLE_RATE = 16000
+        self.SAMPLE_RATE = 24000
         self.CHANNELS = 1
         self.DTYPE = np.int16
         
@@ -749,7 +749,8 @@ class RealtimeVoiceChat:
             channels=self.CHANNELS,
             dtype=self.DTYPE,
             callback=self.audio_callback,
-            blocksize=512  # Smaller blocksize for lower latency
+            blocksize=512,  # Smaller blocksize for lower latency
+            latency = 'low'
         )
         self.output_stream.start()
 
@@ -850,6 +851,11 @@ class RealtimeVoiceChat:
         except Exception as e:
             print(f"[RealtimeVoiceChat] Message handling error: {str(e)}")
 
+
+    def stop_playback(self):
+        """Stop the current audio playback by clearing the audio buffer."""
+        self.audio_buffer.clear()
+
     def capture_audio(self):
         """Capture audio from the microphone."""
         def callback(indata, frames, time_info, status):
@@ -858,11 +864,12 @@ class RealtimeVoiceChat:
             self.audio_queue.put(indata.copy())
         
         with sd.InputStream(
-            samplerate=self.SAMPLE_RATE,
+            samplerate=16000,
             channels=self.CHANNELS,
             dtype=self.DTYPE,
             blocksize=512,  # Reduced for lower latency
-            callback=callback
+            callback=callback,
+            latency='low'
         ):
             print("Audio capture started")
             while self.running:
@@ -905,6 +912,20 @@ class RealtimeVoiceChat:
         except Exception as e:
             print(f"Event send error: {str(e)}")
             self.stop()
+
+    def send_text_input(self, text):
+        """Send user text input as a conversation item via WebSocket."""
+        event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text}
+                ]
+            }
+        }
+        self.send_event(event)
 
     def on_error(self, ws, error):
         print(f"WebSocket error: {str(error)}")
