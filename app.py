@@ -1,6 +1,6 @@
 # Adventure Game
 import os
-os.environ['SDL_VIDEODRIVER'] = 'x11'  # Use native macOS window system
+os.environ['SDL_VIDEODRIVER'] = 'x11'  
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
 import pygame
@@ -22,7 +22,10 @@ from threading import Thread
 import base64
 import json
 from queue import Empty
+from collections import deque
 
+
+print(sd.query_devices())
 
 # Load environment variables
 load_dotenv()
@@ -165,6 +168,7 @@ def draw_sphere(radius, slices, stacks):
 
 class DialogueSystem:
     def __init__(self):
+        
         self.active = False
         self.user_input = ""
         try:
@@ -182,7 +186,7 @@ class DialogueSystem:
         self.current_voice_config = {}
         self.interrupt_flag = False
         self.response_buffer = ""
-
+        
         # Create a surface for the UI
         self.ui_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA).convert_alpha()
         self.ui_texture = glGenTextures(1)
@@ -333,7 +337,9 @@ class DialogueSystem:
             
         # Set the NPC's greeting as the current message
         self.npc_message = initial_message[npc_role]
-        
+        print(f"[DialogueSystem] Initial message: {self.npc_message}")
+
+
         # Initialize conversation history with system prompt only
         self.conversation_history = [{
             "role": "system",
@@ -349,22 +355,30 @@ class DialogueSystem:
         }
         
         # Initialize voice chat with dynamic configuration
-        self.voice_chat = RealtimeVoiceChat(
-            system_prompt=system_prompt,
-            dialogue_system=self,
-            voice_config=self.current_voice_config
-        )
-        self.voice_chat.start_session()
+        if not self.voice_chat:  # Check if voice_chat is not already initialized
+            self.voice_chat = RealtimeVoiceChat(
+                system_prompt=system_prompt,
+                dialogue_system=self,
+                voice_config=self.current_voice_config
+            )
+            self.voice_chat.start_session()
+        
+        else:
+            # Reset existing session for new NPC
+            self.voice_chat.audio_buffer.clear()  # Clear old audio data
+            self.voice_chat.system_prompt = system_prompt
+            self.voice_chat.voice_config = self.current_voice_config
+            self.voice_chat.send_event({
+                "type": "session.update",
+                "session": {
+                    "instructions": system_prompt,
+                    "voice": self.current_voice_config.get('voice', 'nova')
+                }
+            })
 
         
         # Disable text input
         self.input_active = False  # Changed from True
-        self.voice_chat = RealtimeVoiceChat(
-            system_prompt=system_prompt,
-            dialogue_system=self,
-            voice_config=self.current_voice_config
-        )
-        self.voice_chat.start_session()
         
         # Set initial NPC message
         self.npc_message = initial_message[npc_role]
@@ -721,15 +735,14 @@ class World:
         draw_cube()  # Replace glutSolidCube with draw_cube
         glPopMatrix()
 
+
 class RealtimeVoiceChat:
     def __init__(self, system_prompt, dialogue_system, voice_config):
         self.system_prompt = system_prompt
         self.dialogue_system = dialogue_system
         self.voice_config = voice_config
         self.audio_queue = Queue()
-        self.response_queue = Queue()
-        self.playback_active = False
-        self.current_utterance = ""
+        self.audio_buffer = deque(maxlen=16000)  # 1 second of audio
         self.running = True
         self.session_id = None
         self.connected = False
@@ -740,8 +753,75 @@ class RealtimeVoiceChat:
             f"Authorization: Bearer {os.getenv('OPENAI_API_KEY')}",
             "OpenAI-Beta: realtime=v1"
         ]
+        
+        # Audio settings
+        self.SAMPLE_RATE = 16000
+        self.CHANNELS = 1
+        self.DTYPE = np.int16
+        
+        # Set default device and sample rate
+        device_index = 12  # HDA Intel PCH: ALC295 Analog
+        sd.default.device = device_index
+        sd.default.samplerate = self.SAMPLE_RATE
+        
+        # Debug: List available devices
+        print("[RealtimeVoiceChat] Available devices:")
+        print(sd.query_devices())
+        
+        # Initialize output stream
+        try:
+            self.output_stream = sd.OutputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype=self.DTYPE,
+                callback=self.audio_callback,
+                blocksize=1024,
+                latency='low',
+                device=device_index
+            )
+            self.output_stream.start()
+            print(f"[RealtimeVoiceChat] Output stream started with device index: {device_index}, sample rate: {self.SAMPLE_RATE} Hz")
+        except Exception as e:
+            print(f"[RealtimeVoiceChat] Failed to start output stream: {e}")
+            raise
+        
+        # Timing debug
+        self.last_time = None
+        self.callback_count = 0
+
+    def audio_callback(self, outdata, frames, time_info, status):
+        current_time = time.time()
+        if self.last_time is None:
+            self.last_time = current_time
+        
+        elapsed = current_time - self.last_time
+        expected = frames / self.SAMPLE_RATE
+        self.callback_count += 1
+        
+        if self.callback_count % 10 == 0:  # Log every ~0.64s
+            print(f"Callback #{self.callback_count}: Elapsed: {elapsed:.3f}s, Expected: {expected:.3f}s, Buffer size: {len(self.audio_buffer)}")
+        
+        self.last_time = current_time
+        
+        if status:
+            print(f"Playback status: {status}")
+        try:
+            if len(self.audio_buffer) >= frames:
+                for i in range(frames):
+                    outdata[i, 0] = self.audio_buffer.popleft()
+            else:
+                available_samples = min(len(self.audio_buffer), frames)
+                for i in range(available_samples):
+                    outdata[i, 0] = self.audio_buffer.popleft()
+                for i in range(available_samples, frames):
+                    outdata[i, 0] = 0
+                print(f"[RealtimeVoiceChat] Buffer underflow: {len(self.audio_buffer)} samples remaining")
+        except Exception as e:
+            print(f"Callback error: {e}")
+            outdata.fill(0)
 
     def start_session(self):
+        """Start the WebSocket connection and audio threads."""
         self.ws = websocket_client.WebSocketApp(
             self.ws_url,
             header=self.headers,
@@ -751,33 +831,17 @@ class RealtimeVoiceChat:
             on_close=self.on_close
         )
         
-        # Start processing threads
-        self.ws_thread = Thread(target=self.ws.run_forever)
-        self.ws_thread.daemon = True
-        self.ws_thread.start()
-
-        self.audio_thread = Thread(target=self.process_audio)
-        self.response_thread = Thread(target=self.process_responses)
+        self.ws_thread = Thread(target=self.ws.run_forever, daemon=True)
+        self.audio_thread = Thread(target=self.process_audio, daemon=True)
         self.capture_thread = Thread(target=self.capture_audio, daemon=True)
-
-        # Start audio processing
+        
+        self.ws_thread.start()
         self.audio_thread.start()
-        self.response_thread.start()
         self.capture_thread.start()
-        # Thread(target=self.capture_audio, daemon=True).start()
-        # Thread(target=self.process_audio, daemon=True).start()
 
-        self.send_event({
-            "type": "audio_session.initialize",
-            "sampling_rate": SAMPLE_RATE,
-            "channels": CHANNELS
-        })
-
-    
     def on_open(self, ws):
         print("WebSocket connection established")
         self.connected = True
-        # Initialize the session using `session.update`
         self.send_event({
             "event_id": "event_123",
             "type": "session.update",
@@ -786,9 +850,7 @@ class RealtimeVoiceChat:
                 "voice": self.voice_config.get('voice', 'nova'),
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
+                "input_audio_transcription": {"model": "whisper-1"},
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,
@@ -796,8 +858,7 @@ class RealtimeVoiceChat:
                     "silence_duration_ms": 500,
                     "create_response": True
                 },
-                "instructions": self.system_prompt, 
-                
+                "instructions": self.system_prompt,
                 "tools": [
                     {
                         "type": "function",
@@ -805,9 +866,7 @@ class RealtimeVoiceChat:
                         "description": "Get the current weather...",
                         "parameters": {
                             "type": "object",
-                            "properties": {
-                                "location": { "type": "string" }
-                            },
+                            "properties": {"location": {"type": "string"}},
                             "required": ["location"]
                         }
                     }
@@ -819,6 +878,7 @@ class RealtimeVoiceChat:
         })
 
     def on_message(self, ws, message):
+        """Handle incoming WebSocket messages."""
         try:
             event = json.loads(message)
             print(f"[RealtimeVoiceChat] Received event: {event['type']}")
@@ -830,22 +890,12 @@ class RealtimeVoiceChat:
             elif event['type'] == 'response.audio.delta':
                 audio_data = event.get('delta', '')
                 if audio_data:
-                    print("[RealtimeVoiceChat] Audio delta received")
-                    self.response_queue.put(audio_data)
-                    
-            elif event['type'] == 'response.audio.done':
-                if not self.response_queue.empty():
-                    audio_chunks = []
-                    while not self.response_queue.empty():
-                        audio_chunks.append(self.response_queue.get())
-                    combined_audio = ''.join(audio_chunks)
-                    self.play_audio(combined_audio)
-                else:
-                    print("[RealtimeVoiceChat] No audio data received before audio.done")
+                    pcm_data = base64.b64decode(audio_data)
+                    audio_array = np.frombuffer(pcm_data, dtype=self.DTYPE)
+                    self.audio_buffer.extend(audio_array)
                     
             elif event['type'] == 'response.text.delta':
-                self.current_utterance += event['delta']
-                self.dialogue_system.npc_message = self.current_utterance
+                self.dialogue_system.npc_message += event['delta']
                 
             elif event['type'] == 'error':
                 print(f"[RealtimeVoiceChat] API Error: {event.get('error', 'Unknown error')}")
@@ -853,97 +903,43 @@ class RealtimeVoiceChat:
         except Exception as e:
             print(f"[RealtimeVoiceChat] Message handling error: {str(e)}")
 
-    def play_audio(self, audio_data):
-        try:
-            self.playback_active = True
-            print("[RealtimeVoiceChat] Playing audio...")
-            pcm_data = base64.b64decode(audio_data)
-            audio_array = np.frombuffer(pcm_data, dtype=np.int16)
-            
-            sd.play(audio_array, SAMPLE_RATE)
-            sd.wait()
-            print("[RealtimeVoiceChat] Audio playback finished")
-        except Exception as e:
-            print(f"[RealtimeVoiceChat] Playback error: {str(e)}")
-        finally:
-            self.playback_active = False
-
-    def finalize_audio(self):
-        self.send_event({
-            "type": "input_audio_buffer.finalize",
-            "timestamp": int(time.time() * 1000)
-        })
-
-    def handle_text_delta(self, delta):
-        self.current_utterance += delta
-        self.dialogue_system.npc_message = self.current_utterance
-        if any(p in delta for p in ['.', '!', '?']):
-            self.finalize_response()
-
-    def handle_interruption(self):
-        self.stop_playback()
-        self.current_utterance = ""
-        self.dialogue_system.npc_message = "Please go on..."
-        self.response_queue.queue.clear()
-
-    def stop_playback(self):
-        sd.stop()
-        self.playback_active = False
-
-    # Audio Processing Optimizations
     def capture_audio(self):
+        """Capture audio from the microphone."""
         def callback(indata, frames, time_info, status):
             if status:
-                print("Audio input error:", status)
-            else:
-                pass
+                print(f"Audio input error: {status}")
             self.audio_queue.put(indata.copy())
         
-        with sd.InputStream(samplerate=16000, channels=1, dtype=DTYPE,
-                            blocksize=1024, callback=callback):
+        with sd.InputStream(
+            samplerate=self.SAMPLE_RATE,
+            channels=self.CHANNELS,
+            dtype=self.DTYPE,
+            blocksize=1024,
+            callback=callback,
+            latency='low',
+            device=0  # Same device as output
+        ):
             print("Audio capture started")
             while self.running:
                 time.sleep(0.1)
-               
-    def process_responses(self):
-        while True:
-            try:
-                audio_data = self.response_queue.get(timeout=0.5)
-                self.play_audio(audio_data)
-            except:
-                if not self.dialogue_system.active:
-                    break
-
 
     def process_audio(self):
+        """Process and send captured audio."""
         print("Audio processing started")
-        audio_buffer = []
         while self.running:
             try:
-                chunk = self.audio_queue.get(timeout=1)
-                audio_buffer.append(chunk)
+                chunk = self.audio_queue.get(timeout=0.1)
                 if chunk is not None and self.session_id:
                     self.send_audio(chunk)
-            # Send chunks in 2-second intervals
-                if len(audio_buffer) >= (SAMPLE_RATE * 2) // 1024:
-                    concatenated = np.concatenate(audio_buffer)
-                    self.send_audio(concatenated)
-                    audio_buffer = []
-                    
             except Empty:
-                if self.dialogue_system.active:
-                    # Finalize when queue empties
-                    if audio_buffer:
-                        concatenated = np.concatenate(audio_buffer)
-                        self.send_audio(concatenated)
-                    self.finalize_audio()
-                    break
-
+                pass
             except Exception as e:
                 if self.running:
                     print(f"Audio processing error: {str(e)}")
+        print("Audio processing stopped")
 
     def send_audio(self, audio_chunk):
+        """Send audio data to the API."""
         try:
             pcm_bytes = audio_chunk.tobytes()
             b64_audio = base64.b64encode(pcm_bytes).decode('utf-8')
@@ -955,18 +951,16 @@ class RealtimeVoiceChat:
             print(f"Audio send error: {str(e)}")
 
     def send_event(self, event):
+        """Send an event to the WebSocket."""
         if not self.connected:
             print("Cannot send event - not connected")
             return
-
         try:
-            print(f"Sending event: {event['type']}")
             self.ws.send(json.dumps(event))
         except Exception as e:
             print(f"Event send error: {str(e)}")
             self.stop()
 
-  
     def on_error(self, ws, error):
         print(f"WebSocket error: {str(error)}")
         self.connected = False
@@ -977,20 +971,23 @@ class RealtimeVoiceChat:
         self.running = False
 
     def stop(self):
+        """Cleanly stop the session."""
         print("Stopping session...")
         self.running = False
+        self.output_stream.stop()
+        self.output_stream.close()
         try:
             if hasattr(self, 'ws') and self.ws.sock and self.ws.sock.connected:
                 self.ws.close()
                 print("WebSocket closed")
-            
-            # Ensure thread termination correctly
-            if hasattr(self, 'ws_thread') and self.ws_thread.is_alive():
+            if self.ws_thread.is_alive():
                 self.ws_thread.join(timeout=1)
-        
+            if self.audio_thread.is_alive():
+                self.audio_thread.join(timeout=1)
+            if self.capture_thread.is_alive():
+                self.capture_thread.join(timeout=1)
         except Exception as e:
             print(f"Error while stopping: {str(e)}")
-        
 
 
 class Player:
@@ -1297,7 +1294,7 @@ class Game3D:
                 pygame.time.Clock().tick(60)
 
             # Voice interaction handling
-            if self.dialogue.voice_chat and self.dialogue.voice_chat.playback_active:
+            if self.dialogue.voice_chat:
                 if pygame.key.get_pressed()[pygame.K_SPACE]:
                     self.dialogue.handle_interruption()
             
